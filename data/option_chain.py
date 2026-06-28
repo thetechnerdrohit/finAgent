@@ -141,6 +141,19 @@ def get_strangle_strikes(chain_data: dict, spot: float, offset: int = 2) -> dict
     }
 
 
+def get_strike_premium(chain_data: dict, strike: float, opt_type: str) -> float:
+    """Return the current premium (last_price) for a specific strike + option type.
+
+    opt_type is "ce" or "pe". Returns 0.0 if the strike/side is missing.
+    Used for marking open strangle legs to market.
+    """
+    oc, _ = _parse_chain(chain_data)
+    if not oc:
+        return 0.0
+    side = oc.get(f"{float(strike):.6f}", {}).get(opt_type.lower(), {})
+    return side.get("last_price", 0) or side.get("ltp", 0) or 0.0
+
+
 def compute_iv_rank(current_iv: float, iv_history: list[float]) -> float:
     """
     IV Rank: percentile of current IV relative to historical range (0-100).

@@ -43,6 +43,7 @@ class TradingEngine:
             init_db, save_trade, save_signal, save_daily_pnl, log_event,
             get_account, save_position, close_position_db,
             update_account_capital, get_open_positions, has_open_position,
+            update_position_price,
         )
 
         # Initialize DB
@@ -63,6 +64,8 @@ class TradingEngine:
         self._close_position_db = close_position_db
         self._update_account_capital = update_account_capital
         self._has_open_position = has_open_position
+        self._update_position_price = update_position_price
+        self._get_open_positions = get_open_positions
 
         # Initialize components
         self.dhan = DhanClient()
@@ -89,8 +92,52 @@ class TradingEngine:
         self.capital = starting_capital
         self.pending_signals = []
 
+        # Load any positions that are already open in the DB so monitoring,
+        # mark-to-market and exit checks survive process restarts.
+        self._rehydrate_positions()
+
         logger.info("Trading engine initialized. Account: %s, Capital: ₹%s, Floor: ₹%s",
                      account_id, f"{self.capital:,.0f}", f"{hard_floor:,.0f}")
+
+    def _rehydrate_positions(self):
+        """Load OPEN positions from the DB into the in-memory position manager."""
+        import json
+        from risk.position_manager import Position
+
+        existing = {p.position_id for p in self.position_manager.get_open_positions()}
+        loaded = 0
+        for row in self._get_open_positions(self.account_id):
+            if row["id"] in existing:
+                continue
+            meta = row.get("metadata")
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = {}
+            entry_date = row["entry_date"]
+            if isinstance(entry_date, str):
+                try:
+                    entry_date = datetime.fromisoformat(entry_date)
+                except Exception:
+                    entry_date = datetime.now()
+            pos = Position(
+                symbol=row["symbol"],
+                strategy=row["strategy"],
+                entry_date=entry_date,
+                entry_price=row["entry_price"],
+                quantity=row["quantity"],
+                direction=row["direction"],
+                stop_loss=row.get("stop_loss", 0) or 0,
+                target=row.get("target", 0) or 0,
+                current_price=row.get("current_price") or row["entry_price"],
+                metadata=meta or {},
+            )
+            pos.position_id = row["id"]
+            self.position_manager.add_position(pos)
+            loaded += 1
+        if loaded:
+            logger.info("Rehydrated %d open position(s) from DB", loaded)
 
     def _save_trade(self, trade: dict):
         self._save_trade_raw(trade, account_id=self.account_id)
@@ -199,7 +246,9 @@ class TradingEngine:
             return
 
         try:
-            stock_data = self.equity_data.get_nifty_universe(period="6mo")
+            from datetime import timedelta
+            eq_from = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+            stock_data = self.equity_data.get_nifty_universe(from_date=eq_from)
 
             # Mean reversion signals
             mr_strategy = self.strategies["equity_mean_reversion"]
@@ -305,8 +354,117 @@ class TradingEngine:
 
             self.pending_signals.remove(signal)
 
+    def update_market_prices(self) -> dict:
+        """Refresh the live ``current_price`` of every open position.
+
+        Equity positions are marked from the latest daily close (and RSI is
+        computed for exit evaluation); strangle legs are marked from the live
+        option chain. The refreshed price is persisted to the DB.
+
+        Returns a ``{position_id: current_data}`` map for exit evaluation.
+        Fetch failures (e.g. Data API not subscribed) are skipped, never fatal.
+        """
+        market = {}
+        positions = self.position_manager.get_open_positions()
+        if not positions:
+            return market
+
+        chain_cache = {}
+        for pos in positions:
+            try:
+                if pos.strategy in ("nifty_strangle", "banknifty_strangle"):
+                    cd = self._mark_strangle(pos, chain_cache)
+                else:
+                    cd = self._mark_equity(pos)
+                if not cd:
+                    continue
+                pos.current_price = cd["current_price"]
+                self._update_position_price(pos.position_id, pos.current_price, self.account_id)
+                market[pos.position_id] = cd
+            except Exception as e:
+                logger.warning("Price update failed for %s: %s", pos.symbol, e)
+        return market
+
+    def _mark_equity(self, pos) -> dict | None:
+        """Mark an equity position from the latest daily close + RSI(14)."""
+        import ta
+        from datetime import timedelta
+        frm = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+        df = self.equity_data.get_stock_data(pos.symbol, from_date=frm)
+        if df is None or len(df) < 15:
+            return None
+        rsi_series = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+        return {
+            "current_price": float(df["Close"].iloc[-1]),
+            "current_rsi": float(rsi_series.iloc[-1]),
+            "current_date": datetime.now(),
+        }
+
+    def _mark_strangle(self, pos, chain_cache: dict) -> dict | None:
+        """Mark a short-strangle position from current CE+PE premiums."""
+        from data.option_chain import get_strike_premium
+        index = "BANKNIFTY" if pos.strategy.startswith("banknifty") else "NIFTY"
+        idx_cfg = config.banknifty if index == "BANKNIFTY" else config.nifty
+
+        chain = chain_cache.get(index)
+        if chain is None:
+            expiries = self.dhan.get_expiry_list(idx_cfg.security_id, "IDX_I")
+            if not expiries:
+                return None
+            chain = self.dhan.get_option_chain(idx_cfg.security_id, "IDX_I", expiries[0])
+            chain_cache[index] = chain
+        if not chain:
+            return None
+
+        ce_strike = pos.metadata.get("ce_strike")
+        pe_strike = pos.metadata.get("pe_strike")
+        if ce_strike is None or pe_strike is None:
+            return None
+
+        ce_cur = get_strike_premium(chain, float(ce_strike), "ce")
+        pe_cur = get_strike_premium(chain, float(pe_strike), "pe")
+        combined = (ce_cur or 0) + (pe_cur or 0)
+        if combined <= 0:
+            return None
+        return {
+            "current_price": combined,
+            "ce_current_premium": ce_cur or 0,
+            "pe_current_premium": pe_cur or 0,
+            "current_date": datetime.now(),
+        }
+
+    def check_exits(self, market: dict = None):
+        """Evaluate each strategy's ``should_exit`` against fresh prices and
+        close any position that triggers a stop-loss / target / expiry / timeout."""
+        if market is None:
+            market = self.update_market_prices()
+
+        floor_breached = self.floor_monitor.is_breached
+        for pos in list(self.position_manager.get_open_positions()):
+            strat = self.strategies.get(pos.strategy)
+            if strat is None:
+                continue
+
+            current_data = dict(market.get(pos.position_id, {}))
+            current_data.setdefault("current_date", datetime.now())
+            current_data.setdefault("current_price", pos.current_price)
+            current_data["floor_breached"] = floor_breached
+
+            try:
+                do_exit, reason = strat.should_exit(pos, current_data)
+            except Exception as e:
+                logger.warning("should_exit failed for %s: %s", pos.symbol, e)
+                continue
+
+            if do_exit:
+                exit_price = current_data.get("current_price", pos.current_price)
+                logger.info("EXIT signal: %s %s — %s @ ₹%.1f",
+                            pos.strategy, pos.symbol, reason, exit_price or 0)
+                self._close_position(pos.position_id, exit_price, reason)
+
     def monitor_mtm(self):
-        """Check mark-to-market on all open positions against hard floor."""
+        """Refresh live prices, check the hard floor, then evaluate exits."""
+        market = self.update_market_prices()
         unrealized = self.position_manager.get_unrealized_pnl()
         result = self.floor_monitor.check_mtm(unrealized)
 
@@ -316,9 +474,14 @@ class TradingEngine:
             self._exit_all_positions("FLOOR_BREACH")
             self._log_event("FLOOR_BREACH", f"Capital dropped to ₹{result['projected']:,.0f}",
                             {"capital": result["capital"], "projected": result["projected"]})
+            return
+
+        # Floor is safe — evaluate per-strategy exit rules against fresh prices.
+        self.check_exits(market)
 
     def close_expiring_positions(self):
-        """Close all option positions at expiry."""
+        """Close all option positions at expiry (marked to current premium)."""
+        self.update_market_prices()
         open_positions = self.position_manager.get_open_positions()
         for pos in open_positions:
             if pos.strategy in ("nifty_strangle", "banknifty_strangle"):
@@ -349,8 +512,10 @@ class TradingEngine:
                 slippage = entry_val * 0.001
 
             # Restore margin + apply P&L
+            # position_manager.close_position() returns gross P&L under "pnl"
+            pnl_gross = result.get("pnl_gross", result.get("pnl", 0))
             margin_used = entry_val  # approximate margin as position value
-            pnl_net = result["pnl_gross"] - cost - slippage
+            pnl_net = pnl_gross - cost - slippage
             self.capital += margin_used + pnl_net
             self.floor_monitor.update_capital(self.capital)
             self.margin_checker.update_capital(self.capital)
@@ -369,7 +534,7 @@ class TradingEngine:
                 "entry_price": result["entry_price"],
                 "exit_price": exit_price,
                 "quantity": result["quantity"],
-                "pnl_gross": result["pnl_gross"],
+                "pnl_gross": pnl_gross,
                 "cost": cost,
                 "slippage": slippage,
                 "pnl_net": pnl_net,

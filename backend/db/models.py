@@ -385,6 +385,17 @@ def close_position_db(position_id: str, account_id: str = DEFAULT_ACCOUNT):
     conn.close()
 
 
+def update_position_price(position_id: str, current_price: float, account_id: str = DEFAULT_ACCOUNT):
+    """Update the marked-to-market price of an open position."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE positions SET current_price = ? WHERE id = ? AND account_id = ?",
+        (current_price, position_id, account_id)
+    )
+    conn.commit()
+    conn.close()
+
+
 def get_open_positions(account_id: str = DEFAULT_ACCOUNT) -> list[dict]:
     """Return all open positions for an account."""
     conn = get_connection()

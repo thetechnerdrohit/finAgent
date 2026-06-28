@@ -19,6 +19,7 @@ COPY agents/ agents/
 COPY backend/ backend/
 COPY notifications/ notifications/
 COPY replay/ replay/
+COPY tools/ tools/
 
 # Create empty .env if not mounted
 RUN touch .env
