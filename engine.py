@@ -67,10 +67,14 @@ class TradingEngine:
         self._update_position_price = update_position_price
         self._get_open_positions = get_open_positions
 
+        # Notifications
+        from notifications.telegram import TelegramNotifier
+
         # Initialize components
         self.dhan = DhanClient()
         self.equity_data = EquityData()
         self.costs = ZerodhaCosts()
+        self.notifier = TelegramNotifier()
         self.floor_monitor = FloorMonitor(hard_floor, starting_capital)
         self.margin_checker = MarginChecker(starting_capital)
         self.position_manager = PositionManager()
@@ -232,6 +236,12 @@ class TradingEngine:
                 logger.info("Signal generated: %s %s @ ₹%.1f, margin ₹%s",
                             signal.direction, signal.symbol, signal.entry_price,
                             f"{signal.margin_required:,.0f}")
+                self.notifier.send_signal({
+                    "direction": signal.direction, "symbol": signal.symbol,
+                    "strategy": signal.strategy, "entry_price": signal.entry_price,
+                    "margin_required": signal.margin_required,
+                    "confidence": signal.confidence, "reasoning": signal.reasoning,
+                })
 
         except Exception as e:
             logger.error("Options scan failed: %s", e, exc_info=True)
@@ -274,6 +284,12 @@ class TradingEngine:
                     "reasoning": signal.reasoning,
                     "metadata": signal.metadata,
                     "status": "PENDING",
+                })
+                self.notifier.send_signal({
+                    "direction": signal.direction, "symbol": signal.symbol,
+                    "strategy": signal.strategy, "entry_price": signal.entry_price,
+                    "margin_required": signal.margin_required,
+                    "confidence": signal.confidence, "reasoning": signal.reasoning,
                 })
 
             logger.info("Equity scan: %d mean reversion signals", len(mr_signals))
@@ -351,6 +367,12 @@ class TradingEngine:
             self._log_event("TRADE_OPENED", f"{signal.direction} {signal.symbol} | margin ₹{signal.margin_required:,.0f} | capital ₹{self.capital:,.0f}",
                             {"position_id": position_id, "price": signal.entry_price,
                              "strategy": signal.strategy, "paper": config.paper_trading})
+
+            self.notifier.send_trade({
+                "mode": mode, "direction": signal.direction, "symbol": signal.symbol,
+                "entry_price": signal.entry_price, "lot_size": signal.lot_size,
+                "strategy": signal.strategy,
+            })
 
             self.pending_signals.remove(signal)
 
@@ -474,6 +496,7 @@ class TradingEngine:
             self._exit_all_positions("FLOOR_BREACH")
             self._log_event("FLOOR_BREACH", f"Capital dropped to ₹{result['projected']:,.0f}",
                             {"capital": result["capital"], "projected": result["projected"]})
+            self.notifier.send_floor_warning(result["projected"], result["floor"])
             return
 
         # Floor is safe — evaluate per-strategy exit rules against fresh prices.
@@ -524,7 +547,7 @@ class TradingEngine:
             self._close_position_db(position_id, self.account_id)
             self._update_account_capital(self.account_id, self.capital)
 
-            self._save_trade({
+            trade = {
                 "position_id": position_id,
                 "strategy": result["strategy"],
                 "symbol": result["symbol"],
@@ -541,10 +564,13 @@ class TradingEngine:
                 "exit_reason": reason,
                 "margin_used": margin_used,
                 "metadata": result.get("metadata", {}),
-            })
+            }
+            self._save_trade(trade)
 
             logger.info("Position closed: %s %s, P&L net: ₹%s, capital: ₹%s, reason: %s",
                          result["symbol"], result["strategy"], f"{pnl_net:,.0f}", f"{self.capital:,.0f}", reason)
+
+            self.notifier.send_trade_closed(trade)
 
     def generate_daily_report(self):
         """Generate and persist daily summary."""
@@ -575,5 +601,15 @@ class TradingEngine:
                      len(open_pos),
                      f"{report['floor_distance']:,.0f}")
 
-        # TODO: Send Telegram notification
+        text = (
+            f"📊 <b>FinAgent Daily Report</b> — {report['date']}\n"
+            f"Mode: {'PAPER' if config.paper_trading else 'LIVE'}\n\n"
+            f"💰 Capital: ₹{self.capital:,.0f}\n"
+            f"📈 Cumulative P&L: ₹{report['cumulative_pnl']:+,.0f}\n"
+            f"📉 Unrealized P&L: ₹{unrealized:+,.0f}\n"
+            f"📋 Open positions: {len(open_pos)}\n"
+            f"🛡️ Floor distance: ₹{report['floor_distance']:,.0f}"
+        )
+        self.notifier.send_daily_report(text)
+
         return report
