@@ -10,7 +10,8 @@ it pings the MAIN bot only when a watched branch advances.
 Config (env / .env, with defaults):
   UPSTREAM_REPO      owner/repo            (default techfreakworm/finAgent)
   UPSTREAM_BRANCHES  comma-separated       (default main,algo-trader)
-  TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID    (main alert bot)
+  TELEGRAM_LOG_BOT_TOKEN / TELEGRAM_LOG_CHAT_ID   (LOGGER bot — keeps the
+      reports bot clean for P&L only; falls back to the main bot if unset)
 """
 import json
 import os
@@ -26,8 +27,9 @@ load_dotenv(ROOT / ".env")
 UPSTREAM = os.getenv("UPSTREAM_REPO", "techfreakworm/finAgent")
 BRANCHES = [b.strip() for b in os.getenv("UPSTREAM_BRANCHES", "main,algo-trader").split(",") if b.strip()]
 STATE = ROOT / "data" / "upstream_watch.json"
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+# Upstream alerts go to the LOGGER bot (not the reports bot, which stays P&L-only).
+TG_TOKEN = os.getenv("TELEGRAM_LOG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_LOG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
 
 def _gh(url):
