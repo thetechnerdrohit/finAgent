@@ -1,9 +1,8 @@
 [Unit]
-Description=algo-trader: poll upstream repo for new commits every 30 minutes
+Description=algo-trader: check upstream repo for new commits daily at 06:30 IST
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=30min
+OnCalendar=*-*-* 06:30:00
 Persistent=true
 
 [Install]
