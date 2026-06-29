@@ -1,0 +1,13 @@
+[Unit]
+Description=algo-trader: watch upstream (Mayank) repo for new commits, alert via Telegram. READ-ONLY, no notification to upstream.
+Documentation=https://github.com/thetechnerdrohit/finAgent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/projects/algo-trader
+Environment=TZ=Asia/Kolkata
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/ubuntu/projects/algo-trader/.venv/bin/python scripts/upstream_watch.py
