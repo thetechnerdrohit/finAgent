@@ -1,17 +1,21 @@
-"""Watch the UPSTREAM repo (Mayank's) for new commits and alert via Telegram.
+"""Watch the UPSTREAM repo (Mayank's) for branch activity and alert via Telegram.
 
 READ-ONLY: queries the public GitHub API anonymously. The upstream owner gets
 NO notification (GitHub never notifies owners of reads/clones/API queries).
 
-State is kept in data/upstream_watch.json (last-seen SHA per branch). On the
-first run it records a baseline and sends a one-time "armed" message; after that
-it pings the MAIN bot only when a watched branch advances.
+Watches ALL branches by default and pings on:
+  * a NEW branch appearing,
+  * any branch gaining new commits,
+  * a branch being deleted.
+Set UPSTREAM_BRANCHES to restrict to a specific comma-separated subset.
 
-Config (env / .env, with defaults):
-  UPSTREAM_REPO      owner/repo            (default techfreakworm/finAgent)
-  UPSTREAM_BRANCHES  comma-separated       (default main,algo-trader)
-  TELEGRAM_LOG_BOT_TOKEN / TELEGRAM_LOG_CHAT_ID   (LOGGER bot — keeps the
-      reports bot clean for P&L only; falls back to the main bot if unset)
+State: data/upstream_watch.json (last-seen SHA per branch). First run records a
+baseline + sends a one-time "armed" message. Alerts go to the LOGGER bot.
+
+Config (env / .env):
+  UPSTREAM_REPO      owner/repo       (default techfreakworm/finAgent)
+  UPSTREAM_BRANCHES  comma-separated  (default: empty = ALL branches)
+  TELEGRAM_LOG_BOT_TOKEN / TELEGRAM_LOG_CHAT_ID  (LOGGER bot; falls back to main)
 """
 import json
 import os
@@ -25,9 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
 UPSTREAM = os.getenv("UPSTREAM_REPO", "techfreakworm/finAgent")
-BRANCHES = [b.strip() for b in os.getenv("UPSTREAM_BRANCHES", "main,algo-trader").split(",") if b.strip()]
+WATCH = [b.strip() for b in os.getenv("UPSTREAM_BRANCHES", "").split(",") if b.strip()]
 STATE = ROOT / "data" / "upstream_watch.json"
-# Upstream alerts go to the LOGGER bot (not the reports bot, which stays P&L-only).
 TG_TOKEN = os.getenv("TELEGRAM_LOG_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_LOG_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -52,6 +55,36 @@ def _tg(text):
         print("telegram send failed:", e)
 
 
+def _branches():
+    """All branches on the upstream repo as {name: head_sha} (paginated)."""
+    out, page = {}, 1
+    while True:
+        data = _gh(f"https://api.github.com/repos/{UPSTREAM}/branches?per_page=100&page={page}")
+        if not data:
+            break
+        for b in data:
+            out[b["name"]] = b["commit"]["sha"]
+        if len(data) < 100:
+            break
+        page += 1
+    return out
+
+
+def _new_commits(branch, prev):
+    """1-line messages for commits on `branch` newer than `prev` (up to 10)."""
+    try:
+        commits = _gh(f"https://api.github.com/repos/{UPSTREAM}/commits"
+                      f"?sha={urllib.parse.quote(branch)}&per_page=10")
+    except Exception:
+        return []
+    out = []
+    for c in commits:
+        if c["sha"] == prev:
+            break
+        out.append(f"- {c['commit']['message'].splitlines()[0]} ({c['commit']['author']['name']})")
+    return out
+
+
 def main():
     state = {}
     if STATE.exists():
@@ -62,36 +95,39 @@ def main():
     STATE.parent.mkdir(parents=True, exist_ok=True)
     first_run = not state
 
-    alerts = []
-    for br in BRANCHES:
-        try:
-            commits = _gh(f"https://api.github.com/repos/{UPSTREAM}/commits?sha={urllib.parse.quote(br)}&per_page=10")
-        except Exception as e:
-            print(f"{br}: fetch failed ({e})")
-            continue
-        if not commits:
-            continue
-        latest = commits[0]["sha"]
-        prev = state.get(br)
-        state[br] = latest
-        if prev and prev != latest:
-            new = []
-            for c in commits:
-                if c["sha"] == prev:
-                    break
-                msg = c["commit"]["message"].splitlines()[0]
-                who = c["commit"]["author"]["name"]
-                new.append(f"- {msg} ({who})")
-            cmp_url = f"https://github.com/{UPSTREAM}/compare/{prev[:7]}...{latest[:7]}"
-            alerts.append(
-                f"Upstream {UPSTREAM} [{br}]: {len(new)} new commit(s)\n"
-                + "\n".join(new[:10]) + f"\n{cmp_url}")
+    try:
+        current = _branches()
+    except Exception as e:
+        print(f"branch list failed: {e}")
+        return
+    if WATCH:
+        current = {k: v for k, v in current.items() if k in WATCH}
 
-    STATE.write_text(json.dumps(state, indent=2))
+    alerts = []
+    if not first_run:
+        for name, sha in current.items():
+            prev = state.get(name)
+            if prev is None:  # brand-new branch
+                head = (_new_commits(name, None)[:1] or [f"@ {sha[:7]}"])[0]
+                alerts.append(
+                    f"NEW upstream branch [{name}]\n{head}\n"
+                    f"https://github.com/{UPSTREAM}/tree/{urllib.parse.quote(name)}")
+            elif prev != sha:  # branch advanced
+                msgs = _new_commits(name, prev)
+                alerts.append(
+                    f"Upstream [{name}]: {len(msgs)} new commit(s)\n"
+                    + "\n".join(msgs[:10])
+                    + f"\nhttps://github.com/{UPSTREAM}/compare/{prev[:7]}...{sha[:7]}")
+        for name in state:  # deleted branch
+            if name not in current:
+                alerts.append(f"Upstream branch DELETED [{name}]")
+
+    STATE.write_text(json.dumps(current, indent=2))
 
     if first_run:
-        msg = (f"Upstream watch armed for {UPSTREAM} (branches: {', '.join(BRANCHES)}). "
-               f"You'll be pinged here when Mayank pushes new commits.")
+        scope = "ALL" if not WATCH else ",".join(WATCH)
+        msg = (f"Upstream watch armed for {UPSTREAM} — watching {scope} branches "
+               f"({len(current)} now). You'll be pinged on new / updated / deleted branches.")
         print(msg)
         _tg(msg)
     elif alerts:
