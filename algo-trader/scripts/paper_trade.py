@@ -812,6 +812,12 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Mirror all logs to the Telegram bot (batched, rate-limit-safe, optional).
+    try:
+        from algotrader.telegram_log import attach_telegram_logging
+        attach_telegram_logging()
+    except Exception:
+        log.exception("telegram logging attach failed")
 
     session_date: date = args.replay or datetime.now(IST).date()
     skip_publish: bool = args.skip_publish or (args.replay is not None)
